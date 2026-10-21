@@ -1,5 +1,4 @@
 """Local, read-only network diagnostics. No credentials or raw Codex logs are collected."""
-import concurrent.futures
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -16,6 +15,7 @@ import ssl
 import subprocess
 import time
 from urllib.parse import urlsplit
+from probe_workers import ProbeWorkers
 
 WINDOW = 7200
 LAYERS = [('gateway', '本地网关', '#d6c28c'), ('proxy_port', 'Clash 端口', '#b69dd8'),
@@ -84,16 +84,19 @@ def https_probe(url, proxy=None):
     connection = None
     started = time.perf_counter()
     stages = {}
+    phase = 'connect'
     try:
         port = target.port or 443
         if proxy:
             p = urlsplit(proxy)
-            connection = http.client.HTTPSConnection(p.hostname, p.port, timeout=4, context=ssl.create_default_context())
+            connection = http.client.HTTPSConnection(p.hostname, p.port, timeout=15, context=ssl.create_default_context())
             connection.set_tunnel(target.hostname, port)
         else:
-            connection = http.client.HTTPSConnection(target.hostname, port, timeout=4, context=ssl.create_default_context())
+            connection = http.client.HTTPSConnection(target.hostname, port, timeout=15, context=ssl.create_default_context())
         connection.connect()
         stages['connect_ms'] = round((time.perf_counter()-started)*1000)
+        phase = 'response'
+        connection.sock.settimeout(8)
         path = target.path or '/'
         if target.query:
             path += '?' + target.query
@@ -106,7 +109,13 @@ def https_probe(url, proxy=None):
         return dict(ms=round((time.perf_counter()-started)*1000), status=status,
                     kind='http_error' if status >= 400 else 'ok', detail=f'HTTP {status}', **stages)
     except Exception as e:
-        return dict(ms=None, status=None, kind='transport_error', detail=type(e).__name__ + ': ' + str(e)[:180], **stages)
+        error = 'tls_timeout' if isinstance(e, TimeoutError) and 'handshake' in str(e).lower() else \
+                'response_timeout' if isinstance(e, TimeoutError) and phase == 'response' else \
+                'connect_timeout' if isinstance(e, TimeoutError) else \
+                'tls_error' if isinstance(e, ssl.SSLError) else \
+                'proxy_unavailable' if proxy and isinstance(e, ConnectionRefusedError) else 'transport_error'
+        return dict(ms=None, status=None, kind='transport_error', error=error,
+                    detail=type(e).__name__ + ': ' + str(e)[:180], **stages)
     finally:
         if connection:
             connection.close()
@@ -147,7 +156,7 @@ class Diagnostics:
         self.log_status = '等待检查本机 Codex 日志'
         self.log_cursor = 0
         self.log_source = None
-        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=7)
+        self.pool = ProbeWorkers(max_workers=7)
         self.queue = queue.Queue()
         self.busy = set()
         self.due = {}
@@ -217,10 +226,13 @@ class Diagnostics:
                 result = fn(*args)
             except Exception as e:
                 result = {'ms': None, 'kind': 'transport_error', 'detail': type(e).__name__ + ': ' + str(e)[:180]}
-            self.queue.put((key, signature, result))
+            if not self.closed:
+                self.queue.put((key, signature, result))
         self.pool.submit(work)
 
     def tick(self, cfg):
+        if self.closed:
+            return
         signatures = self.signatures(cfg)
         while True:
             try:
@@ -303,6 +315,8 @@ class Diagnostics:
         return '正在积累对照数据。提示只用于缩小排查范围，不能自动判定责任。'
 
     def close(self):
+        if self.closed:
+            return
         self.closed = True
         self.save()
         self.pool.shutdown(wait=False, cancel_futures=True)

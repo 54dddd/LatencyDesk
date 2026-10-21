@@ -7,7 +7,7 @@ try {
     }
     & '.venv/Scripts/python.exe' -m pip install -r requirements-build.txt
     if ($LASTEXITCODE -ne 0) { throw '安装构建依赖失败。' }
-    & '.venv/Scripts/python.exe' -m unittest -v test_diagnostics
+    & '.venv/Scripts/python.exe' -m unittest -v test_diagnostics test_monitor
     if ($LASTEXITCODE -ne 0) { throw '测试失败，未生成 EXE。' }
     $icon = (Resolve-Path 'latency.ico').Path
     $version = (Resolve-Path 'version_info.txt').Path
